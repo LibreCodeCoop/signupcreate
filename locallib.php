@@ -25,6 +25,7 @@
 
 defined('MOODLE_INTERNAL') || die();
 
+////////// Course libs
 require_once($CFG->libdir.'/completionlib.php');
 require_once($CFG->libdir.'/filelib.php');
 require_once($CFG->libdir.'/datalib.php');
@@ -36,6 +37,15 @@ require_once($CFG->dirroot . '/login/lib.php');
 require_once($CFG->libdir . '/formslib.php');
 
 
+//////////// Enrol libs
+require_once($CFG->dirroot.'/enrol/locallib.php');
+require_once($CFG->dirroot.'/group/lib.php');
+require_once($CFG->dirroot.'/enrol/manual/locallib.php');
+require_once($CFG->dirroot.'/cohort/lib.php');
+require_once($CFG->dirroot . '/enrol/manual/classes/enrol_users_form.php');
+
+
+
 define('COURSE_MAX_LOGS_PER_PAGE', 1000);       // Records.
 define('COURSE_MAX_RECENT_PERIOD', 172800);     // Two days, in seconds.
 
@@ -45,17 +55,14 @@ define('COURSE_MAX_RECENT_PERIOD', 172800);     // Two days, in seconds.
 class course_signupcreate_handler {
 
     /**
-     * signupcreate a course and either return a $course object
-     *
-     * Please note this functions does not verify any access control,
-     * the calling code is responsible for all validation (usually it is the form definition).
+     * Create a course and enrol user with teacher role
      *
      * @param array $editoroptions course description editor options
      * @param object $data  - all the data needed for an entry in the 'course' table
      * @return object new course instance
      */
     function user_created($data, $editoroptions = NULL) {
-        global $DB, $CFG;
+        global $DB, $CFG, $PAGE;
 
         $authplugin = signup_is_enabled();
         $mform_signup = $authplugin->signup_form();
@@ -63,12 +70,12 @@ class course_signupcreate_handler {
 
         if($user->profile_field_PERFIL == "Quero dar aulas"){
             $data = new StdClass;
-            $data->category = "2";
+            $data->category = "16"; // Generic
             $data->fullname = $user->firstname . " " . $user->lastname;
             $data->shortname = time();
             $data->timecreated = time();
             $data->timemodified = $data->timecreated;
-            $data->visible = "1";
+            $data->visible = "0"; // start invisible
             $data->visibleold = $data->visible;
             $data->sortorder = 0; // place at beginning of any category
         }
@@ -89,22 +96,10 @@ class course_signupcreate_handler {
         } 
 
 
-        if ($editoroptions) {
-            // summary text is updated later, we need context to store the files first
-            $data->summary = '';
-            $data->summary_format = FORMAT_HTML;
-        }
-        
-
         $newcourseid = $DB->insert_record('course', $data);
         $context = context_course::instance($newcourseid, MUST_EXIST);
 
-        if ($editoroptions) {
-            // Save the files used in the summary editor and store
-            $data = file_postupdate_standard_editor($data, 'summary', $editoroptions, $context, 'course', 'summary', 0);
-            $DB->set_field('course', 'summary', $data->summary, array('id'=>$newcourseid));
-            $DB->set_field('course', 'summaryformat', $data->summary_format, array('id'=>$newcourseid));
-        }
+
         if ($overviewfilesoptions = course_overviewfiles_options($newcourseid)) {
             // Save the course overviewfiles
             $data = file_postupdate_standard_filemanager($data, 'overviewfiles', $overviewfilesoptions, $context, 'course', 'overviewfiles', 0);
@@ -139,28 +134,79 @@ class course_signupcreate_handler {
         $newsections = array_diff(range(0, $numsections), $existingsections);
         foreach ($newsections as $sectionnum) {
             course_create_section($newcourseid, $sectionnum, true);
+        }          
+        
+        
+        $course = $DB->get_record('course', array('id'=>$newcourseid), '*', MUST_EXIST);
+
+        //////////////// Add manual enrolment method to the course created    
+
+        $plugin = enrol_get_plugin("manual");
+        if (!$plugin) {
+            throw new moodle_exception('invaliddata', 'error');
         }
 
+        $fields = array();
+        $fields["status"] = "0";
+        $fields["roleid"] = "5"; // student
+        $fields["enrolperiod"] = 0;
+        $fields["expirynotify"] = "0";
+        $fields["expirythreshold"] = 0;
+        $fields["id"] = 0;
+        $fields["courseid"] = $newcourseid;
+        $fields["type"] = "manual";
+        $fields["returnurl"] = "";
+        $fields["submitbutton"] = "";
 
-        // set up enrolments
-        //enrol_course_updated(true, $course, $data);
+        $plugin->add_instance($course, $fields);
+        
 
-        // Update course tags.
-        if (isset($data->tags)) {
-            core_tag_tag::set_item_tags('core', 'course', $course->id, context_course::instance($course->id), $data->tags);
+        //////////// Enrol user in his course as teacher //////////////
+
+        $PAGE->set_url(new moodle_url('/enrol/ajax.php', array('id'=>$newcourseid, 'action'=>"enrol")));
+        $manager = new course_enrolment_manager($PAGE, $course);    
+
+        $user_data = $DB->get_record('user', array('username' => $user->username), '*', MUST_EXIST);                
+
+        $selfinstance = $DB->get_record('enrol', array('courseid' => $course->id, 'enrol' => 'manual'));
+            
+        $roleid = 3; // teacher
+        
+        $recovergrades = optional_param('recovergrades', 0, PARAM_INT);
+        $timeend = optional_param_array('timeend', [], PARAM_INT);
+    
+        $timestart = intval(substr(time(), 0, 8) . '00') - 1;        
+        $timeend = 0;
+        
+        $mform = new enrol_manual_enrol_users_form(null, (object)["context" => $context]);
+        $userenroldata = [
+                'startdate' => $timestart,
+                'timeend' => $timeend,
+        ];
+        $mform->set_data($userenroldata);
+        $validationerrors = $mform->validation($userenroldata, null);
+        if (!empty($validationerrors)) {
+            throw new enrol_ajax_exception('invalidenrolduration');
         }
+        
+        $instances = $manager->get_enrolment_instances();
+        $plugins = $manager->get_enrolment_plugins(true); // Do not allow actions on disabled plugins.
+        if (!array_key_exists($selfinstance->id, $instances)) {
+            throw new enrol_ajax_exception('invalidenrolinstance');
+        }
+        $instance = $instances[$selfinstance->id];
+        if (!isset($plugins[$instance->enrol])) {
+            throw new enrol_ajax_exception('enrolnotpermitted');
+        }
+        $plugin = $plugins[$instance->enrol];
+        if ($plugin->allow_enrol($instance)) {
+            
+            $plugin->enrol_user($instance, $user_data->id, $roleid, $timestart, $timeend, null, $recovergrades);
 
-/*         // Save custom fields if there are any of them in the form.
-        $handler = core_course\customfield\course_handler::create();
-        // Make sure to set the handler's parent context first.
-        $coursecatcontext = context_coursecat::instance($category->id);
-        $handler->set_parent_context($coursecatcontext);
-        // Save the custom field data.
-        $data->id = $course->id;
-        $handler->instance_form_save($data, true); */
-
-        return $course;
+        } else {
+            throw new enrol_ajax_exception('enrolnotpermitted');
+        }
+    
     }
-
 
 }
