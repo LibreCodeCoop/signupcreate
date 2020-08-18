@@ -35,6 +35,13 @@ require_once($CFG->dirroot . '/user/editlib.php');
 require_once($CFG->libdir . '/authlib.php');
 require_once($CFG->dirroot . '/login/lib.php');
 require_once($CFG->libdir . '/formslib.php');
+require_once($CFG->dirroot . '/course/modlib.php');
+
+require_once($CFG->libdir . '/moodlelib.php');
+
+
+require_once($CFG->libdir.'/gradelib.php');
+require_once($CFG->libdir.'/plagiarismlib.php');
 
 
 //////////// Enrol libs
@@ -43,6 +50,8 @@ require_once($CFG->dirroot.'/group/lib.php');
 require_once($CFG->dirroot.'/enrol/manual/locallib.php');
 require_once($CFG->dirroot.'/cohort/lib.php');
 require_once($CFG->dirroot . '/enrol/manual/classes/enrol_users_form.php');
+
+
 
 
 
@@ -70,19 +79,39 @@ class course_signupcreate_handler {
 
         if($user->profile_field_PERFIL == "Quero dar aulas"){
             $data = new StdClass;
-            $data->category = "16"; // Generic
             $data->fullname = $user->firstname . " " . $user->lastname;
             $data->shortname = time();
+            $data->category = "16"; // Generic
             $data->timecreated = time();
             $data->timemodified = $data->timecreated;
             $data->visible = "0"; // start invisible
             $data->visibleold = $data->visible;
             $data->sortorder = 0; // place at beginning of any category
+            $data->format = "singleactivity";
+            $data->activitytype = "scheduler";
+            $data->addcourseformatoptionshere = 0;
+            $data->lang = "";
+            $data->showgrades = "0";
+            $data->showreports = "0";
+            $data->maxbytes = "0";
+            $data->enablecompletion = "0";
+            $data->groupmode = "0";
+            $data->groupmodeforce = "0";
+            $data->startdate = time();
         }
         
 
         //check the categoryid - must be given for all new courses
         $category = $DB->get_record('course_categories', array('id'=>$data->category), '*', MUST_EXIST);
+
+        $editoroptions = array('maxfiles' => EDITOR_UNLIMITED_FILES, 'maxbytes'=>$CFG->maxbytes, 'trusttext'=>false, 'noclean'=>true);
+
+        if ($editoroptions) {
+            // summary text is updated later, we need context to store the files first
+            $data->summary = '';
+            $data->summary_format = FORMAT_HTML;
+        }
+
 
         // Check if the idnumber already exists.
         if (!empty($data->idnumber)) {
@@ -106,7 +135,16 @@ class course_signupcreate_handler {
         }
 
         // update course format options
-        course_get_format($newcourseid)->update_course_format_options($data);
+        //course_get_format($newcourseid)->update_course_format_options($data);
+
+        /////// Set course format as Single activity of scheduler
+        $DB->insert_record('course_format_options', array(
+            'courseid' => $newcourseid,
+            'format' => 'singleactivity',
+            'sectionid' => 0,
+            'name' => 'activitytype',
+            'value' => 'scheduler'
+        ));
 
         $course = course_get_format($newcourseid)->get_course();
 
@@ -138,6 +176,99 @@ class course_signupcreate_handler {
         
         
         $course = $DB->get_record('course', array('id'=>$newcourseid), '*', MUST_EXIST);
+
+        ///////////// Add a scheduler module
+
+        $add    = "scheduler";
+        $sectionreturn = 0;
+        $section = 0;
+
+        $course = $DB->get_record('course', array('id'=>$course->id), '*', MUST_EXIST);
+
+        $module = $DB->get_record('modules', array('name'=>$add), '*', MUST_EXIST);
+
+        $context = context_course::instance($course->id);
+
+        course_create_sections_if_missing($course, $section);
+        $cw = get_fast_modinfo($course)->get_section_info($section);
+
+        $cm = null;
+
+        $data = new stdClass();
+        $data->section          = $section;  // The section number itself - relative!!! (section column in course_sections)
+        $data->visible          = $cw->visible;
+        $data->course           = $course->id;
+        $data->module           = $module->id;
+        $data->modulename       = $module->name;
+        $data->groupmode        = $course->groupmode;
+        $data->groupingid       = $course->defaultgroupingid;
+        $data->id               = '';
+        $data->instance         = '';
+        $data->coursemodule     = '';
+
+        // Apply completion defaults.
+        $defaults = \core_completion\manager::get_default_completion($course, $module);
+        foreach ($defaults as $key => $value) {
+            $data->$key = $value;
+        }
+
+        $data->return = 0;
+        $data->sr = $sectionreturn;
+        $data->add = $add;
+
+        $modmoodleform = "$CFG->dirroot/mod/$module->name/mod_form.php";
+        if (file_exists($modmoodleform)) {
+            require_once($modmoodleform);
+        } else {
+            print_error('noformdesc');
+        }
+
+        $mformclassname = 'mod_'.$module->name.'_mod_form';
+        $mform = new $mformclassname($data, $cw->section, $cm, $course);
+        $mform->set_data($data);
+
+        $fromform = new stdClass;
+        $fromform->name = "Agendamento";
+        $fromform->introeditor["text"] = "";
+        $fromform->introeditor["format"] = "1";
+        //$fromform->introeditor["itemid"] = 774987156;
+        $fromform->mform_isexpanded_id_optionhdr = 1;
+        $fromform->staffrolename = "";
+        $fromform->maxbookings = "1";
+        $fromform->schedulermode = "oneonly";
+        $fromform->guardtime = 0;
+        $fromform->guardtime = 60;
+        $fromform->allownotifications = "1";
+        $fromform->usenotes = "1";
+        $fromform->grade = 0;
+        $fromform->grade_rescalegrades = null;
+        $fromform->gradepass = null;
+        $fromform->usebookingform = "0";
+        $fromform->bookinginstructions_editor["text"] = "";
+        $fromform->bookinginstructions_editor["format"] = "1";
+        //$fromform->bookinginstructions_editor["itemid"] = 579901108;
+        $fromform->usestudentnotes = "0";
+        $fromform->uploadmaxfiles = "0";
+        $fromform->requireupload = 0;
+        $fromform->visible = 1;
+        $fromform->visibleoncoursepage = 1;
+        $fromform->cmidnumber = "";
+        $fromform->groupmode = "0";
+        $fromform->groupingid = "0";
+        $fromform->availabilityconditionsjson = "{\"op\":\"&\",\"c\":[],\"showc\":[]}";
+        $fromform->course = $course->id;
+        $fromform->coursemodule = 0;
+        $fromform->section = $section;
+        $fromform->module = $module->id;
+        $fromform->modulename = $module->name;
+        $fromform->instance = 0;
+        $fromform->add = $add;
+
+        $GLOBALS["USER"]->id = 1; // set user as (Admin) to have right to create module
+
+        add_moduleinfo($fromform, $course, $mform);
+
+        $GLOBALS["USER"]->id = 0; // set user as 0
 
         //////////////// Add manual enrolment method to the course created    
 
